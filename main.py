@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Enterprise Background Removal Service - FIXED VERSION
+Enterprise Background Removal Service - IMPROVED VERSION
 Core implementation for Raspberry Pi 5 + Hailo-8L
 
-Fixed to use redis-py instead of aioredis to avoid Python 3.11 compatibility issues
+- Implements realistic Hailo post-processing for YOLOv5-Seg.
+- Uses Redis for persistent job storage, surviving restarts.
+- Switched to async redis client for non-blocking operations.
+- Centralized configuration.
 """
 
 import asyncio
@@ -11,18 +14,18 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 import json
 import uuid
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 import cv2
 import aiofiles
-import redis  # Changed from aioredis to redis
+from redis import asyncio as redis # Use async redis client
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -40,6 +43,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Data Models ---
+
 class ProcessingStatus(Enum):
     PENDING = "pending"
     PROCESSING = "processing"
@@ -49,7 +54,6 @@ class ProcessingStatus(Enum):
 
 class ProcessingMethod(Enum):
     HAILO = "hailo"
-    CPU_MEDIAPIPE = "cpu_mediapipe"
     CPU_OPENCV = "cpu_opencv"
 
 @dataclass
@@ -64,366 +68,253 @@ class ProcessingJob:
     completed_at: Optional[float]
     error_message: Optional[str]
     progress: float
-    estimated_completion: Optional[float]
     retry_count: int
     metadata: Dict[str, Any]
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize dataclass to a dictionary for Redis storage."""
+        data = asdict(self)
+        data['input_path'] = str(self.input_path)
+        data['output_path'] = str(self.output_path)
+        data['status'] = self.status.value
+        data['method'] = self.method.value if self.method else None
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ProcessingJob':
+        """Deserialize dictionary from Redis back to a dataclass instance."""
+        data['input_path'] = Path(data['input_path'])
+        data['output_path'] = Path(data['output_path'])
+        data['status'] = ProcessingStatus(data['status'])
+        data['method'] = ProcessingMethod(data['method']) if data['method'] else None
+        # Ensure all fields are present
+        field_names = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in field_names}
+        return cls(**filtered_data)
+
+# --- Configuration ---
+
 class ProcessingConfig:
-    """Configuration for background removal processing"""
-    
     def __init__(self):
-        self.max_resolution = (4096, 4096)
-        self.target_processing_time = 60.0  # seconds
+        self.max_resolution = (1920, 1080)
         self.max_retries = 3
-        self.quality_threshold = 0.8
         self.hailo_enabled = HAILO_AVAILABLE
         self.temp_dir = Path("/tmp/bg_removal")
-        self.output_dir = Path("./data/outputs")  # Updated path
+        self.output_dir = Path("./data/outputs")
         self.cleanup_age_hours = 24
-        
-        # Create directories
+        self.hailo_model_path = Path("./models/yolov5n_seg.hef")
+        self.hailo_confidence_threshold = 0.4 # Confidence for object detection
+
         self.temp_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True, parents=True)
 
+# --- Core Processing Classes ---
+
 class HailoBackgroundRemover:
-    """Hailo-8L accelerated background removal using YOLOv5n segmentation"""
-    
-    def __init__(self):
-        self.model = None
+    def __init__(self, config: ProcessingConfig):
+        self.config = config
         self.device = None
-        self.input_vstream = None
-        self.output_vstreams = None
+        self.network_group = None
+        self.hef = None
         self.initialized = False
-        self.model_path = "./models/yolov5n_seg.hef"
-        
+
     async def initialize(self) -> bool:
-        """Initialize Hailo YOLOv5n segmentation model"""
+        if not HAILO_AVAILABLE:
+            logger.warning("Hailo SDK not available, cannot initialize.")
+            return False
+        if not self.config.hailo_model_path.exists():
+            logger.error(f"Hailo model file not found: {self.config.hailo_model_path}")
+            return False
         try:
-            if not HAILO_AVAILABLE:
-                logger.warning("Hailo SDK not available")
-                return False
-            
-            # Check if model file exists
-            import os
-            if not os.path.exists(self.model_path):
-                logger.error(f"Model file not found: {self.model_path}")
-                return False
-                
             logger.info("Initializing Hailo-8L with YOLOv5n segmentation...")
-            
-            # Initialize device
             self.device = hailort.Device()
-            logger.info(f"Hailo device initialized: {self.device.get_device_id()}")
-            
-            # Load HEF file
-            hef_file = HEFFile(self.model_path)
-            
-            # Configure network group
-            configure_params = ConfigureParams.create_from_hef(hef_file, interface=hailort.HailoStreamInterface.PCIe)
-            network_group = self.device.configure(hef_file, configure_params)[0]
-            
-            # Create input and output virtual streams
-            input_vstream_info = hef_file.get_input_vstream_infos()[0]
-            output_vstream_infos = hef_file.get_output_vstream_infos()
-            
-            self.input_vstream = InputVStream.create(network_group, input_vstream_info)
-            self.output_vstreams = [OutputVStream.create(network_group, output_info) 
-                                   for output_info in output_vstream_infos]
-            
+            self.hef = HEFFile(str(self.config.hailo_model_path))
+            configure_params = ConfigureParams.create_from_hef(self.hef, interface=hailort.HailoStreamInterface.PCIe)
+            self.network_group = self.device.configure(self.hef, configure_params)[0]
             self.initialized = True
-            logger.info("Hailo YOLOv5n segmentation model initialized successfully")
+            logger.info("Hailo-8L initialized successfully.")
             return True
-            
         except Exception as e:
             logger.error(f"Failed to initialize Hailo model: {e}")
             return False
-    
-    def _preprocess_for_yolov5(self, image: np.ndarray, target_size: Tuple[int, int] = (640, 640)) -> np.ndarray:
-        """Preprocess image for YOLOv5n input format"""
-        # Resize image
+
+    def _preprocess(self, image: np.ndarray, target_size: Tuple[int, int] = (640, 640)) -> Tuple[np.ndarray, Tuple[int, int]]:
+        original_shape = image.shape[:2] # H, W
         resized = cv2.resize(image, target_size)
-        
-        # Convert BGR to RGB if needed
-        if len(resized.shape) == 3 and resized.shape[2] == 3:
-            resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [0, 1] and convert to float32
-        normalized = resized.astype(np.float32) / 255.0
-        
-        # Add batch dimension and transpose to CHW format
-        # From HWC (Height, Width, Channels) to CHW (Channels, Height, Width)
-        preprocessed = np.transpose(normalized, (2, 0, 1))
-        preprocessed = np.expand_dims(preprocessed, axis=0)  # Add batch dimension
-        
-        return preprocessed
-    
-    def _postprocess_segmentation(self, outputs, original_shape: Tuple[int, int]) -> Tuple[np.ndarray, float]:
+        rgb_image = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        normalized = rgb_image.astype(np.float32) / 255.0
+        transposed = np.transpose(normalized, (2, 0, 1))
+        return np.expand_dims(transposed, axis=0), original_shape
+
+    def _postprocess(self, outputs: list, original_shape: Tuple[int, int]) -> np.ndarray:
         """
-        Postprocess YOLOv5n segmentation outputs to create background mask
-        Returns: (result_image_rgba, confidence)
+        Post-process YOLOv5-Seg output to create a person mask.
+        NOTE: This is a plausible implementation. The exact output tensor indices and shapes
+        might need to be adjusted based on the specific model compilation.
         """
-        try:
-            # YOLOv5n segmentation typically outputs:
-            # - Detection boxes and classes
-            # - Segmentation masks
-            
-            # For this implementation, we'll create a person mask
-            # This is a simplified version - you might need to adjust based on actual output format
-            
-            height, width = original_shape[:2]
-            
-            # Initialize mask (assume background initially)
-            person_mask = np.zeros((height, width), dtype=np.uint8)
-            
-            # Process outputs to find person segments
-            # Note: This is simplified - actual YOLOv5n output processing would be more complex
-            if len(outputs) > 0:
-                # Find person class (usually class 0 in COCO dataset)
-                # Create mask from segmentation output
-                
-                # For now, create a basic center-focused mask as fallback
-                # In real implementation, this would use actual segmentation masks
-                center_x, center_y = width // 2, height // 2
-                mask_region = cv2.ellipse(person_mask, 
-                                        (center_x, center_y), 
-                                        (width // 3, height // 2), 
-                                        0, 0, 360, 255, -1)
-                person_mask = mask_region
-            
-            confidence = 0.85  # Placeholder confidence
-            
-            return person_mask, confidence
-            
-        except Exception as e:
-            logger.error(f"Postprocessing failed: {e}")
-            # Fallback to center mask
-            height, width = original_shape[:2]
-            center_mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.ellipse(center_mask, (width//2, height//2), (width//3, height//2), 0, 0, 360, 255, -1)
-            return center_mask, 0.5
-    
-    async def remove_background(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
-        """
-        Remove background using Hailo YOLOv5n segmentation
-        Returns: (result_image_rgba, confidence_score)
-        """
+        # Assumed output format for YOLOv5-Seg:
+        # outputs[0]: Detections [batch, num_anchors, 85 classes + 32 mask coeffs]
+        # outputs[1]: Mask prototypes [batch, 32 mask coeffs, h/4, w/4]
+        detections = outputs[0][0]
+        mask_prototypes = outputs[1][0]
+        
+        # Filter for 'person' class (class_id 0 in COCO) with high confidence
+        person_detections = detections[
+            (detections[:, 4] > self.config.hailo_confidence_threshold) &
+            (np.argmax(detections[:, 5:85], axis=1) == 0)
+        ]
+        
+        if len(person_detections) == 0:
+            logger.warning("No person detected by Hailo model.")
+            return np.zeros(original_shape, dtype=np.uint8)
+
+        # Get mask coefficients for detected persons
+        mask_coeffs = person_detections[:, 85:]
+        
+        # Combine mask prototypes with coefficients (matrix multiplication)
+        segmentation_masks = np.matmul(mask_coeffs, mask_prototypes.reshape(32, -1))
+        segmentation_masks = segmentation_masks.reshape(-1, 160, 160) # Reshape to proto H, W
+
+        # Apply sigmoid, threshold, and combine masks
+        segmentation_masks = 1 / (1 + np.exp(-segmentation_masks)) # Sigmoid
+        masks_binary = (segmentation_masks > 0.5).astype(np.uint8)
+        
+        # Combine all person masks into one
+        final_mask = np.max(masks_binary, axis=0)
+        
+        # Resize mask to original image size
+        resized_mask = cv2.resize(final_mask, (original_shape[1], original_shape[0]), interpolation=cv2.INTER_NEAREST)
+        return resized_mask * 255
+
+
+    async def remove_background(self, image: np.ndarray) -> np.ndarray:
         if not self.initialized:
             raise RuntimeError("Hailo model not initialized")
+        
+        start_time = time.time()
+        input_data, original_shape = self._preprocess(image)
+
+        with InputVStream.create(self.network_group) as input_vstream, \
+             OutputVStream.create(self.network_group, self.hef.get_output_vstream_infos()[0]) as detections_vstream, \
+             OutputVStream.create(self.network_group, self.hef.get_output_vstream_infos()[1]) as masks_vstream:
             
-        try:
-            start_time = time.time()
-            original_shape = image.shape
-            
-            logger.info("Running Hailo YOLOv5n segmentation inference...")
-            
-            # Preprocess image
-            input_data = self._preprocess_for_yolov5(image)
-            
-            # Run inference
-            with self.input_vstream:
-                with self.output_vstreams[0]:  # Assuming single output for simplicity
-                    # Send input
-                    self.input_vstream.send(input_data)
-                    
-                    # Get outputs
-                    outputs = []
-                    for output_vstream in self.output_vstreams:
-                        output = output_vstream.recv()
-                        outputs.append(output)
-            
-            # Postprocess to get person mask
-            person_mask, confidence = self._postprocess_segmentation(outputs, original_shape)
-            
-            # Create RGBA result
-            result = cv2.cvtColor(image, cv2.COLOR_RGB2RGBA)
-            
-            # Apply mask to alpha channel
-            # person_mask should be 255 for person, 0 for background
-            result[:, :, 3] = person_mask
-            
-            processing_time = time.time() - start_time
-            logger.info(f"Hailo segmentation completed in {processing_time:.2f}s")
-            
-            return result, confidence
-            
-        except Exception as e:
-            logger.error(f"Hailo processing failed: {e}")
-            # Fallback to simple center-based segmentation
-            height, width = image.shape[:2]
-            fallback_mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.ellipse(fallback_mask, (width//2, height//2), (width//3, height//2), 0, 0, 360, 255, -1)
-            
-            result = cv2.cvtColor(image, cv2.COLOR_RGB2RGBA)
-            result[:, :, 3] = fallback_mask
-            
-            return result, 0.3  # Low confidence for fallback
+            input_vstream.send(input_data)
+            detections = detections_vstream.recv()
+            masks = masks_vstream.recv()
+
+        person_mask = self._postprocess([detections, masks], original_shape)
+
+        # Create RGBA image and apply mask to alpha channel
+        rgba_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
+        rgba_image[:, :, 3] = person_mask
+
+        logger.info(f"Hailo processing completed in {time.time() - start_time:.2f}s")
+        return rgba_image
 
 class CPUBackgroundRemover:
-    """CPU-based background removal fallback"""
-    
-    def __init__(self):
-        self.method = "opencv_grabcut"
-    
-    async def remove_background(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
-        """
-        Remove background using CPU methods
-        Returns: (result_image, confidence_score)
-        """
-        try:
-            start_time = time.time()
-            
-            # Use GrabCut algorithm as a simple CPU fallback
-            height, width = image.shape[:2]
-            
-            # Create rectangle for GrabCut (assume subject is in center)
-            rect = (width//8, height//8, 3*width//4, 3*height//4)
-            
-            # Initialize masks
-            mask = np.zeros((height, width), np.uint8)
-            bgd_model = np.zeros((1, 65), np.float64)
-            fgd_model = np.zeros((1, 65), np.float64)
-            
-            # Apply GrabCut
-            cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
-            
-            # Create final mask
-            mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
-            
-            # Apply morphological operations to clean up mask
-            kernel = np.ones((3, 3), np.uint8)
-            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel)
-            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel)
-            
-            # Smooth edges
-            mask2 = cv2.GaussianBlur(mask2, (5, 5), 0)
-            
-            # Create RGBA output
-            result = cv2.cvtColor(image, cv2.COLOR_RGB2RGBA)
-            result[:, :, 3] = mask2 * 255
-            
-            processing_time = time.time() - start_time
-            confidence = 0.70  # Lower confidence for CPU method
-            
-            logger.info(f"CPU processing completed in {processing_time:.2f}s")
-            return result, confidence
-            
-        except Exception as e:
-            logger.error(f"CPU processing failed: {e}")
-            raise
+    async def remove_background(self, image: np.ndarray) -> np.ndarray:
+        start_time = time.time()
+        height, width = image.shape[:2]
+        rect = (width//10, height//10, 8*width//10, 8*height//10)
+        mask = np.zeros((height, width), np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+        final_mask = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+        
+        # Apply morphological operations for cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel)
+        
+        rgba_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
+        rgba_image[:, :, 3] = final_mask * 255
+        
+        logger.info(f"CPU (GrabCut) processing completed in {time.time() - start_time:.2f}s")
+        return rgba_image
+
+# --- Job Management ---
+
+class JobStore:
+    def __init__(self, redis_client: redis.Redis):
+        self.redis_client = redis_client
+        self.prefix = "bg_removal_job"
+
+    async def get_job(self, job_id: str) -> Optional[ProcessingJob]:
+        job_key = f"{self.prefix}:{job_id}"
+        job_data = await self.redis_client.hgetall(job_key)
+        if not job_data:
+            return None
+        return ProcessingJob.from_dict(job_data)
+
+    async def save_job(self, job: ProcessingJob):
+        job_key = f"{self.prefix}:{job.job_id}"
+        await self.redis_client.hset(job_key, mapping=job.to_dict())
+
+    async def get_all_job_ids(self) -> list[str]:
+        keys = await self.redis_client.keys(f"{self.prefix}:*")
+        return [key.split(':')[-1] for key in keys]
+
+# --- Main Engine ---
 
 class BackgroundRemovalEngine:
-    """Main processing engine with multiple backends"""
-    
     def __init__(self, config: ProcessingConfig):
         self.config = config
-        self.hailo_remover = HailoBackgroundRemover()
+        self.hailo_remover = HailoBackgroundRemover(config)
         self.cpu_remover = CPUBackgroundRemover()
-        self.job_queue: Dict[str, ProcessingJob] = {}
-        
-        # Simple Redis connection (no aioredis)
-        try:
-            self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-            self.redis_client.ping()  # Test connection
-            logger.info("Connected to Redis successfully")
-        except Exception as e:
-            logger.warning(f"Redis connection failed: {e}. Using in-memory storage.")
-            self.redis_client = None
-        
+        self.redis_client = redis.from_url("redis://localhost", decode_responses=True)
+        self.job_store = JobStore(self.redis_client)
+
     async def initialize(self):
-        """Initialize processing backends"""
-        logger.info("Initializing background removal engine...")
+        try:
+            await self.redis_client.ping()
+            logger.info("Connected to Redis successfully.")
+        except Exception as e:
+            logger.critical(f"Redis connection failed: {e}. The service cannot run without Redis.")
+            raise
         
-        # Try to initialize Hailo
-        hailo_ready = await self.hailo_remover.initialize()
-        if hailo_ready:
-            logger.info("Hailo acceleration available")
-        else:
-            logger.warning("Hailo acceleration not available, using CPU fallback")
-            
-        logger.info("Background removal engine initialized")
-    
-    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Preprocess image for optimal processing"""
-        height, width = image.shape[:2]
-        max_w, max_h = self.config.max_resolution
-        
-        # Scale down if image is too large
-        if width > max_w or height > max_h:
-            scale = min(max_w / width, max_h / height)
-            new_width = int(width * scale)
-            new_height = int(height * scale)
-            image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
-            logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
-        
-        return image
-    
-    def _postprocess_image(self, image: np.ndarray, original_size: Tuple[int, int]) -> np.ndarray:
-        """Postprocess result image"""
-        current_height, current_width = image.shape[:2]
-        orig_width, orig_height = original_size
-        
-        # Resize back to original size if needed
-        if current_width != orig_width or current_height != orig_height:
-            image = cv2.resize(image, (orig_width, orig_height), interpolation=cv2.INTER_LANCZOS4)
-        
-        return image
-    
-    async def process_image(self, job_id: str) -> ProcessingJob:
-        """Process a single image job"""
-        job = self.job_queue[job_id]
-        
+        if self.config.hailo_enabled:
+            await self.hailo_remover.initialize()
+
+    async def process_image_task(self, job_id: str):
+        job = await self.job_store.get_job(job_id)
+        if not job:
+            logger.error(f"Job {job_id} not found in store for processing.")
+            return
+
         try:
             job.status = ProcessingStatus.PROCESSING
             job.started_at = time.time()
             job.progress = 0.1
+            await self.job_store.save_job(job)
             
-            # Load image
-            logger.info(f"Loading image for job {job_id}")
             image = cv2.imread(str(job.input_path))
-            if image is None:
-                raise ValueError("Could not load image")
+            if image is None: raise ValueError("Could not load image file.")
             
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            original_size = (image.shape[1], image.shape[0])  # width, height
-            
-            job.progress = 0.2
-            
-            # Preprocess
-            processed_image = self._preprocess_image(image)
-            job.progress = 0.3
-            
-            # Choose processing method
-            processing_method = ProcessingMethod.HAILO if self.hailo_remover.initialized else ProcessingMethod.CPU_OPENCV
-            job.method = processing_method
-            
-            # Process with selected method
-            if processing_method == ProcessingMethod.HAILO:
-                result, confidence = await self.hailo_remover.remove_background(processed_image)
+            job.progress = 0.2; await self.job_store.save_job(job)
+
+            # Choose method and process
+            if self.hailo_remover.initialized:
+                job.method = ProcessingMethod.HAILO
+                result_rgba = await self.hailo_remover.remove_background(image)
             else:
-                result, confidence = await self.cpu_remover.remove_background(processed_image)
+                job.method = ProcessingMethod.CPU_OPENCV
+                result_rgba = await self.cpu_remover.remove_background(image)
             
-            job.progress = 0.8
-            
-            # Postprocess
-            final_result = self._postprocess_image(result, original_size)
-            job.progress = 0.9
+            job.progress = 0.9; await self.job_store.save_job(job)
             
             # Save result
-            output_image = Image.fromarray(final_result, 'RGBA')
-            output_image.save(job.output_path, 'PNG', optimize=True)
+            output_image = Image.fromarray(result_rgba, 'RGBA')
+            output_image.save(job.output_path, 'PNG')
             
-            job.progress = 1.0
             job.status = ProcessingStatus.COMPLETED
+            job.progress = 1.0
             job.completed_at = time.time()
-            job.metadata['confidence'] = confidence
-            job.metadata['processing_method'] = processing_method.value
-            job.metadata['original_size'] = original_size
-            job.metadata['final_size'] = (final_result.shape[1], final_result.shape[0])
-            
-            logger.info(f"Job {job_id} completed successfully")
-            
+            logger.info(f"Job {job_id} completed successfully with {job.method.value}.")
+
         except Exception as e:
-            logger.error(f"Job {job_id} failed: {e}")
+            logger.error(f"Job {job_id} failed: {e}", exc_info=True)
             job.status = ProcessingStatus.FAILED
             job.error_message = str(e)
             job.completed_at = time.time()
@@ -432,182 +323,110 @@ class BackgroundRemovalEngine:
             if job.retry_count < self.config.max_retries:
                 job.retry_count += 1
                 job.status = ProcessingStatus.RETRYING
-                logger.info(f"Retrying job {job_id} (attempt {job.retry_count})")
-                await asyncio.sleep(2 ** job.retry_count)  # Exponential backoff
-                return await self.process_image(job_id)
-        
-        return job
-    
-    def create_job(self, input_file: UploadFile) -> str:
-        """Create a new processing job"""
+                await self.job_store.save_job(job)
+                logger.info(f"Retrying job {job_id} (attempt {job.retry_count}) in {2**job.retry_count}s")
+                await asyncio.sleep(2 ** job.retry_count)
+                await self.process_image_task(job_id) # Recursive call for retry
+                return
+
+        await self.job_store.save_job(job)
+
+    async def create_job(self, file: UploadFile) -> ProcessingJob:
         job_id = str(uuid.uuid4())
-        
-        # Create file paths
-        input_path = self.config.temp_dir / f"{job_id}_input{Path(input_file.filename).suffix}"
-        output_path = self.config.output_dir / f"{job_id}_output.png"
+        input_path = self.config.temp_dir / f"{job_id}{Path(file.filename).suffix}"
+        output_path = self.config.output_dir / f"{job_id}.png"
         
         job = ProcessingJob(
-            job_id=job_id,
-            input_path=input_path,
-            output_path=output_path,
-            status=ProcessingStatus.PENDING,
-            method=None,
-            created_at=time.time(),
-            started_at=None,
-            completed_at=None,
-            error_message=None,
-            progress=0.0,
-            estimated_completion=None,
-            retry_count=0,
-            metadata={}
+            job_id=job_id, input_path=input_path, output_path=output_path,
+            status=ProcessingStatus.PENDING, method=None, created_at=time.time(),
+            started_at=None, completed_at=None, error_message=None,
+            progress=0.0, retry_count=0, metadata={}
         )
         
-        self.job_queue[job_id] = job
-        return job_id
-    
-    async def cleanup_old_files(self):
-        """Clean up old temporary and output files"""
-        cutoff_time = time.time() - (self.config.cleanup_age_hours * 3600)
-        
-        for job_id, job in list(self.job_queue.items()):
-            if job.created_at < cutoff_time and job.status in [ProcessingStatus.COMPLETED, ProcessingStatus.FAILED]:
-                try:
-                    job.input_path.unlink(missing_ok=True)
-                    job.output_path.unlink(missing_ok=True)
-                    del self.job_queue[job_id]
-                    logger.info(f"Cleaned up job {job_id}")
-                except Exception as e:
-                    logger.error(f"Failed to cleanup job {job_id}: {e}")
+        async with aiofiles.open(input_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
+            
+        await self.job_store.save_job(job)
+        return job
 
-# FastAPI Application
-app = FastAPI(title="Enterprise Background Removal Service", version="1.0.0")
+    async def cleanup_old_files(self):
+        cutoff_time = time.time() - (self.config.cleanup_age_hours * 3600)
+        job_ids = await self.job_store.get_all_job_ids()
+        
+        for job_id in job_ids:
+            job = await self.job_store.get_job(job_id)
+            if job and job.created_at < cutoff_time:
+                job.input_path.unlink(missing_ok=True)
+                job.output_path.unlink(missing_ok=True)
+                await self.job_store.redis_client.delete(f"{self.job_store.prefix}:{job_id}")
+                logger.info(f"Cleaned up old job {job_id}")
+
+# --- FastAPI Application ---
+
+app = FastAPI(title="Enterprise Background Removal Service", version="1.1.0")
 config = ProcessingConfig()
 engine = BackgroundRemovalEngine(config)
 
-# Request/Response models
+# --- API Models ---
 class JobResponse(BaseModel):
     job_id: str
     status: str
-    estimated_completion: Optional[float] = None
 
 class StatusResponse(BaseModel):
-    job_id: str
-    status: str
-    progress: float
-    error_message: Optional[str] = None
-    processing_method: Optional[str] = None
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    metadata: Dict[str, Any] = {}
+    job: Dict[str, Any]
+
+# --- API Endpoints ---
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the processing engine on startup"""
     await engine.initialize()
-    
-    # Start cleanup task
-    asyncio.create_task(periodic_cleanup())
+    app.state.cleanup_task = asyncio.create_task(periodic_cleanup())
+    app.state.startup_time = time.time()
 
 async def periodic_cleanup():
-    """Periodic cleanup task"""
     while True:
-        try:
-            await asyncio.sleep(3600)  # Run every hour
-            await engine.cleanup_old_files()
-        except Exception as e:
-            logger.error(f"Cleanup task error: {e}")
+        await asyncio.sleep(3600) # Run every hour
+        logger.info("Running periodic cleanup task...")
+        await engine.cleanup_old_files()
 
 @app.post("/api/v1/process", response_model=JobResponse)
-async def process_image(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="Image file to process")
-):
-    """Process a single image for background removal"""
-    
-    # Validate file type
+async def create_processing_job(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="File must be an image")
+        raise HTTPException(status_code=400, detail="File must be an image.")
     
-    try:
-        # Create job
-        job_id = engine.create_job(file)
-        job = engine.job_queue[job_id]
-        
-        # Save uploaded file
-        async with aiofiles.open(job.input_path, 'wb') as f:
-            content = await file.read()
-            await f.write(content)
-        
-        # Start processing in background
-        background_tasks.add_task(engine.process_image, job_id)
-        
-        return JobResponse(
-            job_id=job_id,
-            status=job.status.value,
-            estimated_completion=time.time() + config.target_processing_time
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to create processing job: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create processing job")
+    job = await engine.create_job(file)
+    background_tasks.add_task(engine.process_image_task, job.job_id)
+    
+    return JobResponse(job_id=job.job_id, status=job.status.value)
 
 @app.get("/api/v1/status/{job_id}", response_model=StatusResponse)
 async def get_job_status(job_id: str):
-    """Get the status of a processing job"""
-    
-    if job_id not in engine.job_queue:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = engine.job_queue[job_id]
-    
-    return StatusResponse(
-        job_id=job.job_id,
-        status=job.status.value,
-        progress=job.progress,
-        error_message=job.error_message,
-        processing_method=job.method.value if job.method else None,
-        created_at=job.created_at,
-        started_at=job.started_at,
-        completed_at=job.completed_at,
-        metadata=job.metadata
-    )
+    job = await engine.job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return StatusResponse(job=job.to_dict())
 
 @app.get("/api/v1/result/{job_id}")
 async def get_job_result(job_id: str):
-    """Download the processed image result"""
-    
-    if job_id not in engine.job_queue:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = engine.job_queue[job_id]
-    
+    job = await engine.job_store.get_job(job_id)
+    if not job: raise HTTPException(status_code=404, detail="Job not found.")
     if job.status != ProcessingStatus.COMPLETED:
-        raise HTTPException(status_code=400, detail=f"Job status: {job.status.value}")
-    
+        raise HTTPException(status_code=400, detail=f"Job not complete. Current status: {job.status.value}")
     if not job.output_path.exists():
-        raise HTTPException(status_code=404, detail="Result file not found")
+        raise HTTPException(status_code=404, detail="Result file not found on disk.")
     
-    return FileResponse(
-        job.output_path,
-        media_type="image/png",
-        filename=f"background_removed_{job_id}.png"
-    )
+    return FileResponse(job.output_path, media_type="image/png")
 
 @app.get("/api/v1/health")
 async def health_check():
-    """System health check endpoint"""
-    
+    redis_ping = await engine.redis_client.ping()
     return {
         "status": "healthy",
-        "hailo_available": engine.hailo_remover.initialized,
-        "redis_available": engine.redis_client is not None,
-        "active_jobs": len([j for j in engine.job_queue.values() if j.status == ProcessingStatus.PROCESSING]),
-        "pending_jobs": len([j for j in engine.job_queue.values() if j.status == ProcessingStatus.PENDING]),
-        "total_jobs": len(engine.job_queue),
-        "uptime": time.time() - app.startup_time if hasattr(app, 'startup_time') else 0
+        "hailo_initialized": engine.hailo_remover.initialized,
+        "redis_connected": redis_ping,
+        "uptime_seconds": time.time() - app.state.startup_time,
     }
 
 if __name__ == "__main__":
-    app.startup_time = time.time()
     uvicorn.run(app, host="0.0.0.0", port=8000)
