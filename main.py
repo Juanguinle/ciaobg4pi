@@ -72,24 +72,55 @@ class ProcessingJob:
     metadata: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize dataclass to a dictionary for Redis storage."""
+        """Serialize dataclass, converting None to empty strings for Redis."""
         data = asdict(self)
+        # Convert specific types to string representations
         data['input_path'] = str(self.input_path)
         data['output_path'] = str(self.output_path)
         data['status'] = self.status.value
-        data['method'] = self.method.value if self.method else None
+        data['method'] = self.method.value if self.method else "" # Handle optional Enum
+        data['metadata'] = json.dumps(self.metadata) # Serialize metadata dict to JSON string
+
+        # Convert any remaining None values to empty strings
+        for key, value in data.items():
+            if value is None:
+                data[key] = ""
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ProcessingJob':
-        """Deserialize dictionary from Redis back to a dataclass instance."""
+        """Deserialize dictionary from Redis, converting empty strings back to None."""
+        # Convert empty strings back to None for optional fields
+        for key in ['started_at', 'completed_at', 'error_message', 'method']:
+            if key in data and data[key] == "":
+                data[key] = None
+        
+        # Convert types back from strings
         data['input_path'] = Path(data['input_path'])
         data['output_path'] = Path(data['output_path'])
         data['status'] = ProcessingStatus(data['status'])
-        data['method'] = ProcessingMethod(data['method']) if data['method'] else None
-        # Ensure all fields are present
+        if data.get('method'):
+            data['method'] = ProcessingMethod(data['method'])
+        
+        # Deserialize metadata from JSON string
+        if 'metadata' in data and data['metadata']:
+            data['metadata'] = json.loads(data['metadata'])
+        else:
+            data['metadata'] = {}
+
+        # Convert numeric types that might be strings from Redis
+        for key in ['created_at', 'progress', 'retry_count', 'started_at', 'completed_at']:
+             if key in data and data[key] is not None:
+                try:
+                    data[key] = float(data[key]) if '.' in str(data[key]) else int(data[key])
+                except (ValueError, TypeError):
+                    # Handle cases where conversion might fail for an empty string that became None
+                    pass
+
+        # Filter for fields that exist in the dataclass to avoid errors
         field_names = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_data = {k: v for k, v in data.items() if k in field_names}
+        
         return cls(**filtered_data)
 
 # --- Configuration ---
