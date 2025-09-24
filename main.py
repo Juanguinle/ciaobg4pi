@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Enterprise Background Removal Service
+Enterprise Background Removal Service - FIXED VERSION
 Core implementation for Raspberry Pi 5 + Hailo-8L
 
-This module provides the main background removal engine with Hailo acceleration
-and CPU fallback capabilities.
+Fixed to use redis-py instead of aioredis to avoid Python 3.11 compatibility issues
 """
 
 import asyncio
@@ -21,7 +20,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 import cv2
 import aiofiles
-import aioredis
+import redis  # Changed from aioredis to redis
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -79,12 +78,12 @@ class ProcessingConfig:
         self.quality_threshold = 0.8
         self.hailo_enabled = HAILO_AVAILABLE
         self.temp_dir = Path("/tmp/bg_removal")
-        self.output_dir = Path("./outputs")
+        self.output_dir = Path("./data/outputs")  # Updated path
         self.cleanup_age_hours = 24
         
         # Create directories
         self.temp_dir.mkdir(exist_ok=True)
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(exist_ok=True, parents=True)
 
 class HailoBackgroundRemover:
     """Hailo-8L accelerated background removal"""
@@ -122,7 +121,6 @@ class HailoBackgroundRemover:
             start_time = time.time()
             
             # Placeholder for actual Hailo inference
-            # This would be replaced with actual Hailo SDK calls
             height, width = image.shape[:2]
             
             # Simulate Hailo processing
@@ -152,7 +150,7 @@ class CPUBackgroundRemover:
     """CPU-based background removal fallback"""
     
     def __init__(self):
-        self.method = "opencv_grabcut"  # Could be "mediapipe", "u2net", etc.
+        self.method = "opencv_grabcut"
     
     async def remove_background(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
         """
@@ -210,6 +208,15 @@ class BackgroundRemovalEngine:
         self.cpu_remover = CPUBackgroundRemover()
         self.job_queue: Dict[str, ProcessingJob] = {}
         
+        # Simple Redis connection (no aioredis)
+        try:
+            self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+            self.redis_client.ping()  # Test connection
+            logger.info("Connected to Redis successfully")
+        except Exception as e:
+            logger.warning(f"Redis connection failed: {e}. Using in-memory storage.")
+            self.redis_client = None
+        
     async def initialize(self):
         """Initialize processing backends"""
         logger.info("Initializing background removal engine...")
@@ -246,11 +253,6 @@ class BackgroundRemovalEngine:
         # Resize back to original size if needed
         if current_width != orig_width or current_height != orig_height:
             image = cv2.resize(image, (orig_width, orig_height), interpolation=cv2.INTER_LANCZOS4)
-        
-        # Additional post-processing could include:
-        # - Edge refinement
-        # - Alpha channel cleanup
-        # - Noise reduction
         
         return image
     
@@ -487,6 +489,7 @@ async def health_check():
     return {
         "status": "healthy",
         "hailo_available": engine.hailo_remover.initialized,
+        "redis_available": engine.redis_client is not None,
         "active_jobs": len([j for j in engine.job_queue.values() if j.status == ProcessingStatus.PROCESSING]),
         "pending_jobs": len([j for j in engine.job_queue.values() if j.status == ProcessingStatus.PENDING]),
         "total_jobs": len(engine.job_queue),
