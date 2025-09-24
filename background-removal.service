@@ -1,0 +1,22 @@
+# systemd service file: /etc/systemd/system/background-removal.service
+[Unit]
+Description=Enterprise Background Removal Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/background-removal
+Environment=PATH=/opt/background-removal/venv/bin
+Environment=PYTHONPATH=/opt/background-removal
+ExecStart=/opt/background-removal/venv/bin/python main.py
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

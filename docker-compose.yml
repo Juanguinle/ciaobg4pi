@@ -1,0 +1,42 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  background-removal-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./outputs:/app/outputs
+      - ./temp:/tmp/bg_removal
+      - /dev/dri:/dev/dri  # For Hailo hardware access
+    environment:
+      - HAILO_ENABLED=true
+      - MAX_RESOLUTION=4096x4096
+      - TARGET_PROCESSING_TIME=60
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+    privileged: true  # Required for Hailo access
+    
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/ssl/private
+    depends_on:
+      - background-removal-api
+    restart: unless-stopped
+
+volumes:
+  redis_data:
